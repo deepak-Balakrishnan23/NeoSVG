@@ -4,6 +4,8 @@
 clean, photograph-grade SVG vectors using a multi-stage intelligence layer and
 an original high-fidelity tracing engine.
 
+![NeoSVG Web Interface](Neosvg.png)
+
 The **NeoSVG Engine** performs hierarchical, local-colour region growing with
 sub-pixel marching-squares contour extraction and Bézier curve fitting. It is
 written from scratch — it does **not** depend on or derive from any
