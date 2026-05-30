@@ -1,15 +1,15 @@
 # NeoSVG
 
 **AI-assisted raster-to-vector pipeline.** NeoSVG converts PNG/JPG images into
-clean, photograph-grade SVG vectors using a multi-stage intelligence layer and
+clean, photograph grade SVG vectors using a multi stage intelligence layer and
 an original high-fidelity tracing engine.
 
 ![NeoSVG Web Interface](Neosvg.png)
 
-The **NeoSVG Engine** performs hierarchical, local-colour region growing with
-sub-pixel marching-squares contour extraction and Bézier curve fitting. It is
-written from scratch — it does **not** depend on or derive from any
-copyleft-licensed vectorization library — so the whole project ships under the
+The **NeoSVG Engine** performs hierarchical, local colour region growing with
+sub-pixel marching squares contour extraction and Bézier curve fitting. It is
+written from scratch, it does **not** depend on or derive from any
+copyleft licensed vectorization library, so the whole project ships under the
 permissive MIT license and is free to use commercially.
 
 ---
@@ -58,7 +58,7 @@ pip install -r requirements.txt
 ```
 
 The quality validator uses `cairosvg`, which needs the native **Cairo**
-library. If Cairo isn't present the pipeline still produces valid SVG — only
+library. If Cairo isn't present the pipeline still produces valid SVG only
 the SSIM quality score is reported as `n/a`.
 
 - macOS: `brew install cairo`
