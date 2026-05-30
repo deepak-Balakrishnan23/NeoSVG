@@ -43,7 +43,7 @@ classify → preprocess → detect text → detect gradients → segment
 output.svg
 ```
 
-Four detail levels (`low`, `medium`, `high`, `ultra`) trade path count against
+Three detail levels (`low`, `medium`, `high`,) trade path count against
 fidelity; `high` is the default and is tuned for smooth gradients without
 scratch artifacts.
 
@@ -137,7 +137,7 @@ static/          Web UI
 
 ## License
 
-Released under the **MIT License** — see [LICENSE](LICENSE). You may use,
+Released under the **MIT License**  You may use,
 modify, and distribute this software, including in commercial and closed-source
 products, provided the copyright notice and license text are retained.
 
