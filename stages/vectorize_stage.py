@@ -47,16 +47,51 @@ _NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
 _SEAM_STROKE_MIN = 0.6   # busy/detail tiles — keep edges crisp
 _SEAM_STROKE_MAX = 4.0   # flat gradient bands — fully seal seams + pin-holes
 
+# A stroke this wide is only ever worth its cost when there is an OPAQUE
+# BACKGROUND RECT behind the tiles to bleed through.  The assembler paints that
+# rect only for opaque inputs — for a transparent input it is skipped entirely,
+# so there is nothing behind the seam and the stroke stops being a fix and
+# becomes pure shape damage: it dilates every path by half its width, which
+# rounds corners, fattens thin features (rules, letterforms) and blurs the
+# silhouette.  Transparent inputs therefore get a hairline, just enough to close
+# the anti-aliased crack between two adjacent tiles.
+_SEAM_STROKE_MAX_TRANSPARENT = 0.8
 
-def _seal_seams(rec: dict) -> None:
+# A seam stroke may never exceed this fraction of a shape's thinnest dimension.
+_SEAM_STROKE_MAX_FRAC = 0.18
+
+
+def _seal_seams(rec: dict, has_transparency: bool = False) -> None:
     """Replace a flat-tile record's rendering with a stroke=fill <path> so the
     background can't bleed through the anti-aliased seam between tiles.  Stroke
-    width scales with the tile's smoothness context."""
+    width scales with the tile's smoothness context, and is capped far lower
+    when no background rect will be painted behind it."""
     d = rec.get("d")
     if not d:
         return
     t = float(rec.get("smooth_ctx", 0.0))
-    sw = _SEAM_STROKE_MIN + max(0.0, min(1.0, t)) * (_SEAM_STROKE_MAX - _SEAM_STROKE_MIN)
+    hi = _SEAM_STROKE_MAX_TRANSPARENT if has_transparency else _SEAM_STROKE_MAX
+    sw = _SEAM_STROKE_MIN + max(0.0, min(1.0, t)) * max(0.0, hi - _SEAM_STROKE_MIN)
+
+    # The stroke straddles the outline, so it grows the shape by half its width
+    # on every side.  On a wide band that is invisible; on a 6px rule a 4px
+    # stroke is a 130% fattening that swallows the gap to its neighbour.  Cap
+    # the width against the feature's THINNEST dimension so a stroke can never
+    # dominate the shape it is sealing.
+    bbox = rec.get("bbox")
+    if bbox:
+        thin = min(float(bbox[2]), float(bbox[3]))
+        if thin > 0:
+            sw = min(sw, max(_SEAM_STROKE_MIN, thin * _SEAM_STROKE_MAX_FRAC))
+
+    # A gradient-filled region must be stroked with that same gradient, or the
+    # flat mean colour would paint a hard border over the ramp it is meant to
+    # seal.  The paint-server id isn't known until the assembler allocates it,
+    # so hand the width over and let the assembler build the element.
+    if rec.get("gradient"):
+        rec["seam_stroke"] = sw
+        return
+
     color = rec.get("color", "#000000")
     op = float(rec.get("opacity", 1.0))
     extra = (f' fill-opacity="{op:.2f}" stroke-opacity="{op:.2f}"'
@@ -91,6 +126,14 @@ def _scale_record(rec: dict, factor: float) -> dict:
         return rec
     if rec.get("d"):
         rec["d"] = _scale_path_coords(rec["d"], factor)
+    # Gradient endpoints are userSpaceOnUse, i.e. in the same coordinate system
+    # as `d` — they must ride along with any rescale or the ramp detaches from
+    # its shape.
+    grad = rec.get("gradient")
+    if grad:
+        for k in ("x1", "y1", "x2", "y2", "cx", "cy", "r"):
+            if k in grad:
+                grad[k] = float(grad[k]) * factor
     tr = rec.get("transform")
     if tr:
         m = re.match(r'translate\(([-\d.]+),\s*([-\d.]+)\)', tr)
@@ -211,7 +254,7 @@ def run_vectorize(ctx: Context) -> Context:
         # Seal anti-aliased tile seams so the assembler's background fill
         # can't bleed through them as scratch hairlines.
         if label == "neosvg":
-            _seal_seams(p)
+            _seal_seams(p, bool(getattr(ctx, "has_transparency", False)))
         real_paths.append(p)
 
     ctx.collected_paths.extend(real_paths)

@@ -14,14 +14,45 @@ logger = logging.getLogger("neosvg.classifier")
 
 
 def _count_quantized_colors(thumb: np.ndarray, n: int = 16) -> int:
-    """K-means on a small thumbnail; returns cluster count actually needed."""
-    h, w = thumb.shape[:2]
+    """
+    Number of VISUALLY DISTINCT colours the image is built from.
+
+    Two bugs used to make this return `n` for every input, which is why LOGO and
+    ICON were unreachable and almost everything classified as PHOTO:
+
+      * `pixels.view(np.uint8)` re-interpreted the bytes of a float32 array as
+        uint8, so the "unique colour" count it produced was a count of raw byte
+        triples straddling channel boundaries — not colours at all.  It always
+        came out far above `n`, so `k` was always `n`.
+      * It then returned `np.unique(labels).size`, the number of distinct
+        cluster labels k-means assigned.  K-means uses every cluster it is
+        given, so that is just `k` again — the answer regardless of the image.
+
+    A colour counts as distinct here when it is both POPULOUS (carries a real
+    share of the image, so anti-aliasing and gradient dithering do not each
+    register as their own colour) and SEPARATED (far enough from the colours
+    already counted to read as a different one).
+    """
     pixels = thumb[:, :, :3].reshape(-1, 3).astype(np.float32)
-    k = min(n, len(np.unique(pixels.view(np.uint8).reshape(-1, 3), axis=0)))
-    k = max(2, k)
+    n_unique = len(np.unique(thumb[:, :, :3].reshape(-1, 3), axis=0))
+    k = max(2, min(n, n_unique))
+
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, _ = cv2.kmeans(pixels, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
-    return int(np.unique(labels).size)
+    _, labels, centers = cv2.kmeans(
+        pixels, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+
+    counts = np.bincount(labels.ravel(), minlength=k).astype(np.float64)
+    order  = np.argsort(counts)[::-1]          # most populous first
+    floor  = len(pixels) * Config.COLOR_MIN_POPULATION
+
+    kept: list = []
+    for i in order:
+        if counts[i] < floor:
+            continue
+        c = centers[i]
+        if all(np.linalg.norm(c - k_) >= Config.COLOR_MIN_SEPARATION for k_ in kept):
+            kept.append(c)
+    return max(1, len(kept))
 
 
 def _avg_saturation(thumb: np.ndarray) -> float:

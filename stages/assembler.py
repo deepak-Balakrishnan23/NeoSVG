@@ -59,6 +59,66 @@ def _gradient_rect_el(gid: str, region: GradientRegion) -> str:
             f'fill="url(#{gid})"/>')
 
 
+# ── per-region gradient (fitted to a traced shape, not a bounding box) ───────
+
+def _region_gradient_def(gid: str, grad: dict) -> str:
+    """
+    A <linearGradient> in userSpaceOnUse coordinates.
+
+    objectBoundingBox (used by the tile-based detector above) would re-map the
+    ramp onto each shape's bbox, which skews the axis on any non-rectangular
+    shape.  These endpoints were fitted in image space and must stay there, so
+    the ramp keeps the exact angle it was measured at.
+    """
+    stop_els = "\n".join(
+        f'    <stop offset="{s["offset"]}" stop-color="{s["color"]}"/>'
+        for s in grad.get("stops", [])
+    )
+    if grad.get("type") == "radial":
+        # An elongated fit is emitted as a circle of radius r plus a transform
+        # that rotates it to `angle` and squashes the perpendicular axis by
+        # 1/aspect — SVG has no native elliptical radial gradient.  The
+        # translate pair brackets the rotate/scale so both act about the
+        # gradient's own centre rather than the origin.
+        asp = float(grad.get("aspect", 1.0))
+        tr  = ""
+        if abs(asp - 1.0) > 1e-6:
+            cx, cy = grad["cx"], grad["cy"]
+            tr = (f' gradientTransform="translate({cx:.3f},{cy:.3f}) '
+                  f'rotate({float(grad.get("angle", 0.0)):.3f}) '
+                  f'scale(1,{1.0 / asp:.5f}) '
+                  f'translate({-cx:.3f},{-cy:.3f})"')
+        return (f'  <radialGradient id="{gid}" '
+                f'cx="{grad["cx"]:.3f}" cy="{grad["cy"]:.3f}" r="{grad["r"]:.3f}" '
+                f'gradientUnits="userSpaceOnUse"{tr}>\n'
+                f'{stop_els}\n'
+                f'  </radialGradient>')
+    return (f'  <linearGradient id="{gid}" '
+            f'x1="{grad["x1"]:.3f}" y1="{grad["y1"]:.3f}" '
+            f'x2="{grad["x2"]:.3f}" y2="{grad["y2"]:.3f}" '
+            f'gradientUnits="userSpaceOnUse">\n'
+            f'{stop_els}\n'
+            f'  </linearGradient>')
+
+
+def _gradient_path_el(
+    d: str,
+    gid: str,
+    opacity: float,
+    transform: Optional[str] = None,
+    seam_stroke: Optional[float] = None,
+) -> str:
+    op_attr = f' fill-opacity="{opacity:.2f}"' if opacity < 1.0 else ""
+    tr_attr = f' transform="{transform}"' if transform else ""
+    # Stroke with the SAME paint server — a flat stroke would draw a hard rim
+    # around the ramp it is supposed to be sealing.
+    st_attr = ""
+    if seam_stroke:
+        st_attr = (f' stroke="url(#{gid})" stroke-width="{float(seam_stroke):.2f}"'
+                   f' stroke-linejoin="round"')
+    return f'<path d="{d}" fill="url(#{gid})"{st_attr}{op_attr}{tr_attr}/>'
+
+
 # ── SVG path element ─────────────────────────────────────────────────────────
 
 def _path_el(d: str, color: str, opacity: float, transform: Optional[str] = None) -> str:
@@ -118,8 +178,14 @@ def assemble(ctx: Context) -> Context:
         color = rec.get("color", "#000000")
         op    = float(rec.get("opacity", 1.0))
 
-        tr = rec.get("transform")
-        el = rec.get("primitive_svg") or (_path_el(d, color, op, tr) if d else None)
+        tr   = rec.get("transform")
+        grad = rec.get("gradient")
+        if grad and d and not rec.get("primitive_svg"):
+            gid = f"nt-rgrad-{len(defs_lines)}"
+            defs_lines.append(_region_gradient_def(gid, grad))
+            el = _gradient_path_el(d, gid, op, tr, rec.get("seam_stroke"))
+        else:
+            el = rec.get("primitive_svg") or (_path_el(d, color, op, tr) if d else None)
         if not el:
             continue
 

@@ -14,6 +14,18 @@ import cv2
 import numpy as np
 
 
+# Spline fitting works on the raw sub-pixel contour.  Beyond this many points a
+# contour is decimated first, purely to bound fitting cost — never enough to
+# flatten curvature (see _RDP_SAFE_EPSILON).
+_RAW_FIT_MAX_POINTS = 1200
+_RDP_SAFE_EPSILON   = 0.5   # sub-pixel: removes collinear runs, keeps curves
+
+# Upper bound on a Bezier tangent magnitude, as a multiple of the segment's
+# chord length.  Beyond this the fit has diverged and the endpoint-derived
+# fallback is used instead.
+_MAX_TANGENT_CHORDS = 3.0
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _rgb_to_hex(r: int, g: int, b: int) -> str:
@@ -46,40 +58,47 @@ def _fit_cubic_bezier(
     Fit a single cubic Bezier to *pts* with tangent constraints.
     Returns a (4, 2) array [P0, P1, P2, P3] or None if the fit is degenerate.
     """
-    n = len(pts)
     t = _chord_lengths(pts)
 
-    # Build A matrix (n × 2 × 2)
-    A = np.zeros((n, 2, 2))
-    for i in range(n):
-        b = _bernstein(t[i])
-        A[i, 0] = b[1] * t_hat1
-        A[i, 1] = b[2] * t_hat2
+    # Vectorised normal equations.  This used to be two Python loops over every
+    # contour point, which is why the caller had to decimate the contour with
+    # RDP before fitting — and that decimation was what turned curves into
+    # polygons.  Fitting straight from the raw sub-pixel contour is only
+    # affordable once this is array work.
+    s  = 1.0 - t
+    b0 = s * s * s
+    b1 = 3.0 * s * s * t
+    b2 = 3.0 * s * t * t
+    b3 = t * t * t
 
-    C = np.zeros((2, 2))
-    X = np.zeros(2)
-    for i in range(n):
-        b = _bernstein(t[i])
-        # contribution of the fixed end-points
-        tmp = (pts[i]
-               - pts[0]  * (b[0] + b[1])
-               - pts[-1] * (b[2] + b[3]))
-        C[0, 0] += A[i, 0] @ A[i, 0]
-        C[0, 1] += A[i, 0] @ A[i, 1]
-        C[1, 0] += A[i, 1] @ A[i, 0]
-        C[1, 1] += A[i, 1] @ A[i, 1]
-        X[0] += A[i, 0] @ tmp
-        X[1] += A[i, 1] @ tmp
+    A0 = b1[:, None] * t_hat1[None, :]          # (n, 2)
+    A1 = b2[:, None] * t_hat2[None, :]
+    tmp = (pts
+           - pts[0][None, :]  * (b0 + b1)[:, None]
+           - pts[-1][None, :] * (b2 + b3)[:, None])
+
+    c00 = float(np.sum(A0 * A0))
+    c01 = float(np.sum(A0 * A1))
+    c11 = float(np.sum(A1 * A1))
+    C = np.array([[c00, c01], [c01, c11]])
+    X = np.array([float(np.sum(A0 * tmp)), float(np.sum(A1 * tmp))])
 
     det = C[0, 0] * C[1, 1] - C[0, 1] * C[1, 0]
     fallback = np.linalg.norm(pts[-1] - pts[0]) / 3.0
+
+    # The tangent magnitudes must be bounded ABOVE as well as below.  On a raw
+    # sub-pixel contour a nearly-straight run with noisy end tangents drives the
+    # least-squares solution to a huge alpha, placing a control point far
+    # outside the shape — which renders as a spike shooting off the outline.
+    # The decimated contours this fitter used to receive hid the problem.
+    max_alpha = max(np.linalg.norm(pts[-1] - pts[0]), 1e-6) * _MAX_TANGENT_CHORDS
 
     if abs(det) < 1e-10:
         alpha1 = alpha2 = fallback
     else:
         alpha1 = (X[0] * C[1, 1] - X[1] * C[0, 1]) / det
         alpha2 = (C[0, 0] * X[1] - C[1, 0] * X[0]) / det
-        if alpha1 < 1e-6 or alpha2 < 1e-6:
+        if not (1e-6 <= alpha1 <= max_alpha) or not (1e-6 <= alpha2 <= max_alpha):
             alpha1 = alpha2 = fallback
 
     return np.array([
@@ -96,20 +115,19 @@ def _max_fit_error(pts: np.ndarray, bez: np.ndarray) -> Tuple[float, int]:
     split_at is clamped to [1, len(pts)-1] so callers can always split into
     two non-empty sub-segments without risking an empty left or right slice.
     """
-    t = _chord_lengths(pts)
-    max_err = 0.0
-    split_at = max(1, len(pts) // 2)
-    for i, ti in enumerate(t):
-        b = _bernstein(ti)
-        approx = (b[0] * bez[0] + b[1] * bez[1]
-                  + b[2] * bez[2] + b[3] * bez[3])
-        err = float(np.linalg.norm(pts[i] - approx))
-        if err > max_err:
-            max_err = err
-            # Keep split_at in a valid range: never 0 (empty left) or
-            # len(pts) (empty right).
-            split_at = max(1, min(i, len(pts) - 1))
-    return max_err, split_at
+    t  = _chord_lengths(pts)
+    s  = 1.0 - t
+    approx = (
+        (s * s * s)[:, None]       * bez[0][None, :]
+        + (3.0 * s * s * t)[:, None] * bez[1][None, :]
+        + (3.0 * s * t * t)[:, None] * bez[2][None, :]
+        + (t * t * t)[:, None]       * bez[3][None, :]
+    )
+    err = np.linalg.norm(pts - approx, axis=1)
+    i   = int(np.argmax(err))
+    # Keep split_at in a valid range: never 0 (empty left) or len(pts)
+    # (empty right).
+    return float(err[i]), max(1, min(i, len(pts) - 1))
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -166,20 +184,50 @@ def _fit_spline_segment(
     return left + right
 
 
-def _detect_corners(pts: np.ndarray, threshold_deg: float) -> List[int]:
+def _detect_corners(pts: np.ndarray, threshold_deg: float,
+                    window: Optional[int] = None) -> List[int]:
     """
-    Return indices of points where the angle between the incoming and
-    outgoing direction vectors is less than *threshold_deg*.
+    Return indices of points where the contour genuinely turns.
+
+    The angle is measured across a WINDOW of points either side, not between
+    the two adjacent segments.  On a raw sub-pixel contour, adjacent segments
+    are roughly one pixel long and their direction is dominated by marching-
+    squares quantisation, so an adjacent-pair test reports corners all along a
+    smooth arc.  Measuring across a window averages that noise out and leaves
+    only real corners.
+
+    Corners are then non-maximum suppressed within the window, so a single
+    sharp turn yields one break rather than a cluster of them.
     """
-    corners = [0]
     n = len(pts)
-    thresh_cos = math.cos(math.radians(threshold_deg))
-    for i in range(1, n - 1):
-        v1 = _unit(pts[i]     - pts[i - 1])
-        v2 = _unit(pts[i + 1] - pts[i])
-        cos_a = float(np.dot(v1, v2))
-        if cos_a < thresh_cos:
-            corners.append(i)
+    if n < 3:
+        return [0, n - 1]
+
+    if window is None:
+        window = max(1, min(6, n // 24))
+
+    i  = np.arange(1, n - 1)
+    a  = pts[np.maximum(i - window, 0)]
+    b  = pts[i]
+    c  = pts[np.minimum(i + window, n - 1)]
+
+    v1 = b - a
+    v2 = c - b
+    n1 = np.linalg.norm(v1, axis=1)
+    n2 = np.linalg.norm(v2, axis=1)
+    ok = (n1 > 1e-10) & (n2 > 1e-10)
+    cos_a = np.ones(len(i))
+    cos_a[ok] = np.sum(v1[ok] * v2[ok], axis=1) / (n1[ok] * n2[ok])
+
+    hit = np.flatnonzero(cos_a < math.cos(math.radians(threshold_deg)))
+
+    corners = [0]
+    last = -window
+    for j in hit:                      # sharpest-first is unnecessary: the
+        idx = int(i[j])                # window already isolates each turn
+        if idx - last >= window:
+            corners.append(idx)
+            last = idx
     corners.append(n - 1)
     return corners
 
@@ -262,8 +310,27 @@ def _contour_to_path(
     if mode == 'polygon':
         return _polygon_to_path(poly_pts, precision)
 
+    # Spline mode does NOT fit the RDP output.  RDP keeps only direction-change
+    # vertices, so every point it returns reads as a corner to the detector
+    # below — the curve is then broken into a hard segment at each one and
+    # rendered as a polygon.  A large region gets a large epsilon, which is why
+    # big smooth shapes suffered worst, and why tightening `bezier_error` made
+    # things worse rather than better: it only subdivided an already-flattened
+    # outline more finely.
+    #
+    # So fit the RAW sub-pixel contour and let `error_threshold` alone decide
+    # how many curves are needed.  RDP is kept only as a cheap decimation for
+    # very long contours, capped so it can never remove real curvature.
+    fit_pts = pts
+    if len(pts) > _RAW_FIT_MAX_POINTS:
+        coarse = cv2.approxPolyDP(contour, min(epsilon, _RDP_SAFE_EPSILON), closed=True)
+        cp = coarse.squeeze().astype(float)
+        if cp.ndim == 2 and len(cp) >= 3:
+            fit_pts = cp
+
     # Spline: detect corners, fit Bezier segments between them
-    corners = _detect_corners(poly_pts, corner_threshold_deg)
+    corners = _detect_corners(fit_pts, corner_threshold_deg)
+    poly_pts = fit_pts
     all_beziers: List[np.ndarray] = []
 
     for k in range(len(corners) - 1):

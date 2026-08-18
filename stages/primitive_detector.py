@@ -261,6 +261,11 @@ def detect_primitives(ctx: Context) -> Context:
 
     replaced = 0
     for rec in ctx.collected_paths:
+        # A region carrying a fitted gradient must keep its <path> — a primitive
+        # is emitted with a flat fill and would throw the ramp away.
+        if rec.get("gradient"):
+            continue
+
         d       = rec.get("d", "")
         color   = rec.get("color", "#000000")
         opacity = rec.get("opacity", 1.0)

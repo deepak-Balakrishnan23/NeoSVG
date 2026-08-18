@@ -42,6 +42,7 @@ import numpy as np
 
 from config import Config
 from engines.path_fitting import _contour_to_path, _rgb_to_hex
+from engines.region_gradient import coalesce_bands, fit_region_gradient, subsample
 from engines.subpixel_contours import subpixel_contours as _sp_contours
 
 try:
@@ -102,7 +103,21 @@ def _smoothness_thresholds(
     # small threshold and all its fine detail.
     busy = (std > busy_std).astype(np.uint8)
     k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    busy = cv2.morphologyEx(busy, cv2.MORPH_OPEN, k)
+    opened = cv2.morphologyEx(busy, cv2.MORPH_OPEN, k)
+
+    # Opening keys off SIZE alone, so it deletes any busy blob narrower than the
+    # kernel — which is the intent for a faint dust streak, but also wipes out
+    # genuine thin features (a rule under a heading, a letterform, a hairline
+    # divider).  Those then inherit the smooth-zone threshold and get merged
+    # into their neighbour, arriving as wavy blobs.
+    #
+    # The streaks this was written to kill are FAINT — that is what makes them
+    # noise.  Real thin features are high-contrast.  So anything far above the
+    # busy threshold is unambiguous structure and is exempt from the opening,
+    # which keeps the size test for the faint case where it belongs.
+    strong = (std > busy_std * Config.THIN_FEATURE_CONTRAST_MULT).astype(np.uint8)
+    busy   = cv2.bitwise_or(opened, strong)
+
     busy = cv2.dilate(busy, k)                       # keep a halo around the subject
     soft = cv2.GaussianBlur(busy.astype(np.float32), (31, 31), 0)  # 0..1, 1 = busy
 
@@ -114,6 +129,107 @@ def _smoothness_thresholds(
     t = np.clip(bmean, 0.0, 1.0)                      # 0 = smooth ctx, 1 = busy ctx
     thr = min_smooth + t * (min_busy - min_smooth)
     return thr
+
+
+def _fit_region_gradients(labels: np.ndarray, rgb: np.ndarray):
+    """
+    Coalesce adjacent near-colour bands, then fit a linear gradient to each
+    resulting group.
+
+    A smooth ramp is labelled as many thin, individually-flat bands; fitting one
+    of those in isolation is meaningless because it holds no variation.  So the
+    bands are chained first (`coalesce_bands`) and the fit is attempted on the
+    whole ramp, using the ORIGINAL pixel colours — the mean-shift/median
+    pre-filter only ever influenced WHERE the band boundaries fell, and those
+    boundaries are exactly what we are dissolving here.
+
+    Returns `(labels, {label: gradient_dict})`.  Accepted groups are collapsed
+    into their root label so the caller traces ONE contour around the whole
+    ramp; groups whose fit was rejected are left untouched and still emit their
+    original flat bands.
+    """
+    n        = int(labels.max()) + 1
+    flat     = labels.ravel()
+    w        = labels.shape[1]
+    rgb_flat = rgb.reshape(-1, 3).astype(np.float64)
+    cap      = Config.REGION_GRADIENT_MAX_SAMPLES
+    min_area = Config.REGION_GRADIENT_MIN_AREA
+
+    gradients: dict = {}
+    remap   = np.arange(n, dtype=np.int64)
+    claimed = np.zeros(n, dtype=bool)
+    # A group that survives a pass unchanged would otherwise be re-fitted from
+    # scratch on every later pass and fail identically each time.  Fitting is
+    # the expensive half of this stage, so remember what has already been tried.
+    tried: set = set()
+
+    # Coarse→fine: a group rejected at a wide delta is retried at a tighter one,
+    # which splits an over-merged blob back into the individual ramps it welded
+    # together.  Labels already claimed are withheld from later passes so the
+    # coarsest ramp that genuinely fits wins.
+    for delta in Config.REGION_GRADIENT_MERGE_DELTAS:
+        if claimed.any():
+            work = labels.copy()
+            work[claimed[labels]] = 0
+        else:
+            work = labels
+
+        roots = coalesce_bands(work, rgb, delta)
+        if roots is None:
+            continue
+        if len(roots) < n:                       # masking can shrink max label
+            roots = np.concatenate(
+                [roots, np.arange(len(roots), n, dtype=roots.dtype)])
+
+        group  = roots[flat]
+        group[claimed[flat]] = 0                 # never revisit a claimed label
+        order  = np.argsort(group, kind="stable")
+        gs     = group[order]
+        bounds = np.searchsorted(gs, np.arange(n + 1))
+
+        for g in np.unique(gs):
+            g = int(g)
+            if g == 0:                           # transparent background
+                continue
+            s, e = bounds[g], bounds[g + 1]
+            if (e - s) < min_area:
+                continue
+
+            idx = order[s:e]
+            # Identity of the pixel set: same root, same size and same extent
+            # means the coalescing produced the same group again.
+            fp = (g, int(e - s), int(idx[0]), int(idx[-1]))
+            if fp in tried:
+                continue
+            tried.add(fp)
+
+            sidx = subsample(idx, cap)
+            # A group still made of one label is a single quantization bucket,
+            # i.e. genuinely flat — a gradient cannot improve on its flat fill.
+            if len(np.unique(flat[sidx])) < 2:
+                continue
+
+            ys, xs = np.divmod(sidx, w)
+            coords = np.column_stack([xs, ys]).astype(np.float64)
+            grad   = fit_region_gradient(coords, rgb_flat[sidx])
+
+            if grad is None:
+                continue
+
+            members = np.unique(flat[idx])
+            gradients[g]    = grad
+            remap[members]  = g
+            claimed[members] = True
+
+    if not gradients:
+        return labels, {}
+
+    logger.info(
+        "Region gradients: %d ramp(s) fitted (mean R²=%.3f)",
+        len(gradients),
+        float(np.mean([v["r2"] for v in gradients.values()])),
+    )
+    return remap[labels], gradients
 
 
 def _merge_small_regions(
@@ -311,8 +427,23 @@ def vectorize(
     # (the faint "scratch" lines in smooth/dark zones).  It deletes thin
     # structures while leaving solid regions and step edges intact.
     if median_k >= 3 and median_k % 2 == 1:
-        work = cv2.medianBlur(work, median_k)
-        logger.info("Median pre-filter: ksize=%d", median_k)
+        med = cv2.medianBlur(work, median_k)
+        # A median filter removes any structure thinner than its kernel.  That
+        # is precisely what is wanted for a faint scratch line, and precisely
+        # what must NOT happen to a real thin feature (a rule, a letter stroke,
+        # a hairline divider) — those are the same width and get erased too,
+        # then arrive as wavy blobs.
+        #
+        # The distinction is contrast, not width: the streaks this targets are
+        # faint by definition.  So the median is applied only where local
+        # contrast is low, and high-contrast pixels keep their original value.
+        g_    = cv2.cvtColor(work, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        win   = (median_k, median_k)
+        mu    = cv2.blur(g_, win)
+        sigma = np.sqrt(np.maximum(cv2.blur(g_ * g_, win) - mu * mu, 0.0))
+        keep  = (sigma > Config.THIN_FEATURE_MEDIAN_GUARD)[:, :, None]
+        work  = np.where(keep, work, med)
+        logger.info("Median pre-filter: ksize=%d (contrast-guarded)", median_k)
     if bilateral_d > 0:
         rgb_f = cv2.bilateralFilter(
             work, d=bilateral_d,
@@ -376,6 +507,15 @@ def vectorize(
         "Clustering: color_precision=%d → %d regions (%d small merged)",
         color_precision, n_labels, n_small)
 
+    # ── Phase 1e: coalesce ramps and fit real gradients ──────────────────
+    # Flat fills cannot represent a ramp, so up to here a gradient could only be
+    # faked with stacked bands (visible banding).  Chain those bands back into
+    # one shape and fit an actual <linearGradient> to it — the contour still
+    # follows the true shape, and the axis is free to point anywhere.
+    gradients: dict = {}
+    if Config.REGION_GRADIENT_ENABLED:
+        labels, gradients = _fit_region_gradients(labels, rgb)
+
     # Region area / bbox / cropped mask / TRUE mean colour (from original rgb).
     props = _regionprops(labels, intensity_image=rgb)
 
@@ -406,7 +546,10 @@ def vectorize(
         if not contours:
             continue
 
-        mean = rp.mean_intensity
+        # `mean_intensity` is deprecated and removed in scikit-image 2.0.
+        mean = getattr(rp, "intensity_mean", None)
+        if mean is None:
+            mean = rp.mean_intensity
         color_hex = _rgb_to_hex(
             int(round(mean[0])), int(round(mean[1])), int(round(mean[2])))
 
@@ -446,14 +589,21 @@ def vectorize(
             if not d:
                 continue
             bx, by, bw, bh = cv2.boundingRect(ci)
-            path_records.append({
+            rec = {
                 "d":          d,
                 "color":      color_hex,
                 "opacity":    1.0,
                 "area":       float(rp.area),
                 "bbox":       (bx, by, bw, bh),
                 "smooth_ctx": smooth_ctx,
-            })
+            }
+            # A fitted ramp carries its gradient; `color` stays as the mean so
+            # the flat fill remains a valid fallback for anything that cannot
+            # resolve the paint server.
+            grad = gradients.get(int(rp.label))
+            if grad is not None:
+                rec["gradient"] = grad
+            path_records.append(rec)
 
     # Painter's order: largest first so smaller detail regions composite on top.
     path_records.sort(key=lambda r: r["area"], reverse=True)

@@ -4,6 +4,12 @@
 class Config:
 
     # ── ImageClassifier ────────────────────────────────────────────────────
+    # A colour is counted as distinct only when it is both populous enough to
+    # be part of the design (not an anti-aliasing or dithering by-product) and
+    # far enough from the colours already counted to read as a different one.
+    COLOR_MIN_POPULATION = 0.004   # min share of pixels for a colour to count
+    COLOR_MIN_SEPARATION = 26.0    # min RGB distance between distinct colours
+
     # Color counts come from k-means on a 64×64 thumbnail.
     LOGO_MAX_UNIQUE_COLORS    = 12    # ≤ this distinct quantized colors → LOGO
     CARTOON_MAX_UNIQUE_COLORS = 40
@@ -54,6 +60,59 @@ class Config:
     # ── GradientDetector ───────────────────────────────────────────────────
     GRADIENT_SMOOTHNESS_CORR = 0.92  # min R² for linear/radial gradient fit
     GRADIENT_MIN_COLOR_RANGE = 30    # min color variation (0-255) to qualify as gradient
+
+    # ── Per-region gradient fitting (NeoSVG Engine) ────────────────────────
+    # The tile-based GradientDetector above scans an axis-aligned grid and can
+    # only emit 0°/90° ramps over rectangles, so it never matches a gradient
+    # that follows a SHAPE (a curved ribbon, a letterform).  Per-region fitting
+    # works on the regions the engine has already segmented — their contours
+    # follow the real shape — so the gradient axis is free to point anywhere
+    # and the ramp is clipped to the shape, not to a bounding box.
+    #
+    # Two steps:
+    #   1. COALESCE — a smooth ramp is initially labelled as N adjacent
+    #      near-flat bands.  Each band alone has almost no colour variation, so
+    #      fitting it individually is pointless.  Adjacent regions whose mean
+    #      colours are within MERGE_DELTA are chained into one super-region;
+    #      because each step is small the chain naturally walks the whole ramp
+    #      while a genuine colour edge (large step) stops it.
+    #   2. FIT — sample the ORIGINAL pixels of the super-region, find the axis
+    #      along which colour varies most, and sample stops along it.  Stops
+    #      are binned means, not a straight line fit, so multi-hue ramps
+    #      (cyan→blue→purple→magenta) are captured exactly.
+    #
+    # If the fit is poor the super-region is discarded and its original bands
+    # are emitted as flat fills — the previous behaviour, so a bad fit can
+    # never make output worse than before.
+    REGION_GRADIENT_ENABLED     = True
+    REGION_GRADIENT_MIN_R2      = 0.90   # min R² of the axis model to accept
+    REGION_GRADIENT_MIN_RANGE   = 26     # min colour spread (0-255) to bother
+    REGION_GRADIENT_STOPS       = 10     # stops sampled along the fitted axis
+    REGION_GRADIENT_MIN_AREA    = 300    # px² — below this a flat fill is fine
+    REGION_GRADIENT_ANGLE_STEPS = 24     # angular sweep resolution for the axis
+    REGION_GRADIENT_MAX_SAMPLES = 4000   # pixel subsample cap (keeps the fit fast)
+
+    # Coalescing runs COARSE→FINE.  One fixed delta cannot work for a whole
+    # image: a delta wide enough to chain a long subtle ramp also welds two
+    # neighbouring ramps into one blob whose colour no longer varies along any
+    # single axis, and the fit is then correctly rejected — losing both.  So a
+    # rejected group is retried at a tighter delta, which splits it back into
+    # its constituent ramps.  Labels claimed by an accepted fit are withheld
+    # from later passes, so the coarsest ramp that actually fits always wins.
+    REGION_GRADIENT_MERGE_DELTAS = (36, 22, 13)
+
+    # ── Thin-feature protection ────────────────────────────────────────────
+    # Local contrast (as a multiple of the busy-context threshold) above which a
+    # feature is treated as unambiguous structure and exempted from the
+    # smooth-zone size test.  The faint streaks that test exists to remove sit
+    # just above the busy threshold; a real rule or letterform sits far above
+    # it.  Lower this to protect fainter detail, raise it to merge harder.
+    THIN_FEATURE_CONTRAST_MULT = 2.5
+
+    # Local standard deviation above which a pixel is considered real structure
+    # and is exempted from the thin-structure median pre-filter.  Faint sensor
+    # streaks sit well below this; a rule or letter stroke sits well above it.
+    THIN_FEATURE_MEDIAN_GUARD = 25.0
 
     # ── Segmenter ──────────────────────────────────────────────────────────
     REMBG_ALPHA_THRESHOLD = 128      # alpha < this → background
