@@ -11,10 +11,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import List, Optional
 
 from context import Context, GradientRegion, TextRegion
+
+#: SVG path command letters, used to count nodes.
+_PATH_COMMANDS = set("MmLlHhVvCcSsQqTtAaZz")
 
 logger = logging.getLogger("neosvg.assembler")
 
@@ -152,8 +156,13 @@ def assemble(ctx: Context) -> Context:
     """
     Build the final SVG string and store it in ctx.final_svg.
     """
-    img = ctx.preprocessed_image if ctx.preprocessed_image is not None \
-        else ctx.original_image
+    # Size from the ORIGINAL image: that is the coordinate space the engine
+    # traced in and therefore the space the path data is expressed in. Taking
+    # the preprocessed image instead only agrees while the preprocessor happens
+    # not to resize — the moment it does, the viewBox desynchronises from every
+    # path (see MIN_DIM_FOR_UPSCALE in config.py, where this bit once already).
+    img = ctx.original_image if ctx.original_image is not None \
+        else ctx.preprocessed_image
     img_h, img_w = (img.shape[:2] if img is not None else (512, 512))
 
     # ── collect gradient defs ─────────────────────────────────────────────────
@@ -172,6 +181,12 @@ def assemble(ctx: Context) -> Context:
     fg_paths: List[str]   = []
     other_paths: List[str] = []
 
+    # One fitted ramp usually covers a region that traced to several contours,
+    # and each of those paths used to mint its own <defs> entry — so a handful
+    # of ramps shipped as many duplicated gradient elements, each a full stop
+    # list. Emit each distinct paint server once and let the siblings share it.
+    grad_ids: dict = {}
+
     for rec in ctx.collected_paths:
         layer = rec.get("layer", "")
         d     = rec.get("d", "")
@@ -181,8 +196,12 @@ def assemble(ctx: Context) -> Context:
         tr   = rec.get("transform")
         grad = rec.get("gradient")
         if grad and d and not rec.get("primitive_svg"):
-            gid = f"nt-rgrad-{len(defs_lines)}"
-            defs_lines.append(_region_gradient_def(gid, grad))
+            key = json.dumps(grad, sort_keys=True, default=str)
+            gid = grad_ids.get(key)
+            if gid is None:
+                gid = f"nt-rgrad-{len(grad_ids)}"
+                grad_ids[key] = gid
+                defs_lines.append(_region_gradient_def(gid, grad))
             el = _gradient_path_el(d, gid, op, tr, rec.get("seam_stroke"))
         else:
             el = rec.get("primitive_svg") or (_path_el(d, color, op, tr) if d else None)
@@ -198,8 +217,12 @@ def assemble(ctx: Context) -> Context:
 
     # ── count statistics for quality report ───────────────────────────────────
     ctx.path_count = len(ctx.collected_paths)
-    total_d = " ".join(r.get("d", "") for r in ctx.collected_paths)
-    ctx.node_count = total_d.count(" ")
+    # A node is a path command (M/L/C/Q/…), not a space. Counting spaces made
+    # the reported figure a function of coordinate formatting rather than of
+    # geometry — a cubic segment writes six numbers and therefore counted six
+    # times, and the number moved whenever precision changed.
+    total_d = "".join(r.get("d", "") for r in ctx.collected_paths)
+    ctx.node_count = sum(1 for ch in total_d if ch in _PATH_COMMANDS)
 
     # ── build viewBox ─────────────────────────────────────────────────────────
     viewbox = _compute_viewbox(ctx.collected_paths, img_w, img_h)

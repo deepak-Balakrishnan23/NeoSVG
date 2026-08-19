@@ -116,10 +116,27 @@ def coalesce_bands(
 
     # Merge in ascending colour distance so the smoothest steps bind first and
     # the chain follows the ramp rather than jumping across a weak edge.
+    #
+    # Single-linkage alone has no notion of how far a GROUP has travelled: every
+    # step is within delta of its neighbour, so a long ramp keeps chaining and
+    # the coarse pass can swallow an entire shape. The resulting blob varies
+    # along no single axis, the fit is correctly rejected, and both the ramp and
+    # its parts are lost. Capping the group's own colour extent stops the chain
+    # where the ramp genuinely ends while leaving ordinary accretion untouched.
+    lo_rgb = means.copy()
+    hi_rgb = means.copy()
+    cap = float(delta) * Config.REGION_GRADIENT_GROUP_SPAN
     for i in np.argsort(dist):
         ra, rb = find(int(lo_u[i])), find(int(hi_u[i]))
-        if ra != rb:
-            parent[max(ra, rb)] = min(ra, rb)
+        if ra == rb:
+            continue
+        new_lo = np.minimum(lo_rgb[ra], lo_rgb[rb])
+        new_hi = np.maximum(hi_rgb[ra], hi_rgb[rb])
+        if float(np.max(new_hi - new_lo)) > cap:
+            continue
+        keep, drop = min(ra, rb), max(ra, rb)
+        parent[drop] = keep
+        lo_rgb[keep], hi_rgb[keep] = new_lo, new_hi
 
     # Resolve every label to its root by pointer jumping.  A per-label Python
     # find() is O(n) calls and was costing more than the merge itself.
@@ -315,18 +332,41 @@ def _fit_radial(
     return best_ss, best_stops, best_c, best_r, best_th, best_asp
 
 
+def _hex(rgb) -> str:
+    r, g, b = rgb
+    return "#%02x%02x%02x" % (
+        int(np.clip(round(r), 0, 255)),
+        int(np.clip(round(g), 0, 255)),
+        int(np.clip(round(b), 0, 255)),
+    )
+
+
 def _stops_to_list(stops: np.ndarray) -> List[Dict]:
-    out: List[Dict] = []
+    """
+    Convert binned stop colours to SVG gradient stops.
+
+    The offsets MUST match the positions the fit was scored at. _binned_stops
+    slices [0,1] into n equal bins and averages each, so stop i represents the
+    bin CENTRE (i + 0.5) / n — which is what _axis_residual and _radial_residual
+    interpolate at. Emitting i / (n - 1) instead stretches the ramp over the
+    full span: with n=10 the curve is pulled out by 1/0.9, so every colour lands
+    up to half a bin away from where the fitter placed it and the accepted
+    gradient can render worse than the flat bands it replaced.
+
+    np.interp holds the end colours constant outside the sampled range, so
+    duplicate clamp stops at 0 and 1 reproduce the scored model exactly.
+    """
     n = len(stops)
-    for i, (r, g, b) in enumerate(stops):
-        out.append({
-            "offset": round(i / (n - 1), 4),
-            "color":  "#%02x%02x%02x" % (
-                int(np.clip(round(r), 0, 255)),
-                int(np.clip(round(g), 0, 255)),
-                int(np.clip(round(b), 0, 255)),
-            ),
-        })
+    if n == 0:
+        return []
+    if n == 1:
+        return [{"offset": 0.0, "color": _hex(stops[0])},
+                {"offset": 1.0, "color": _hex(stops[0])}]
+
+    out: List[Dict] = [{"offset": 0.0, "color": _hex(stops[0])}]
+    for i, rgb in enumerate(stops):
+        out.append({"offset": round((i + 0.5) / n, 4), "color": _hex(rgb)})
+    out.append({"offset": 1.0, "color": _hex(stops[-1])})
     return out
 
 
@@ -360,7 +400,16 @@ def fit_region_gradient(
 
     # A region with no colour spread is a flat fill by definition — bail before
     # doing any work, and before a near-zero SS_tot makes R² meaningless.
-    spread = float(np.max(colors, axis=0).max() - np.min(colors, axis=0).min())
+    #
+    # This has to be the spread WITHIN a channel. Taking the max over all
+    # channels minus the min over all channels measures the separation BETWEEN
+    # channels instead, so a perfectly flat saturated colour (R=250, B=10)
+    # scores 240 and clears any sane threshold — the gate never rejected
+    # anything on saturated artwork. Percentiles rather than min/max so a
+    # handful of stray pixels cannot open it either.
+    hi = np.percentile(colors, 98, axis=0)
+    lo = np.percentile(colors, 2, axis=0)
+    spread = float(np.max(hi - lo))
     if spread < min_range:
         return None
 
@@ -431,6 +480,10 @@ def fit_region_gradient(
             "aspect": round(float(rad_asp), 4),
             "stops":  _stops_to_list(stops),
             "r2":     round(float(r2), 4),
+            # Residual on the sampled pixels. The caller compares it against
+            # what the flat bands would cost, so it must stay in the SAME units
+            # (sum of squared error over `colors`).
+            "ss_res": float(ss_res),
         }
 
     p1 = centre + u * t_min
@@ -443,6 +496,7 @@ def fit_region_gradient(
         "y2":    float(p2[1]),
         "stops": _stops_to_list(stops),
         "r2":    round(float(r2), 4),
+        "ss_res": float(ss_res),
     }
 
 

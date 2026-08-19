@@ -42,6 +42,79 @@ def _load_image(path: str):
     return img
 
 
+def _ramp_hard_ratio(image) -> float:
+    """
+    Ratio of smooth-ramp pixels to hard-edge pixels in the luma gradient.
+
+    High  → the image is mostly continuous tone (gradients, soft shading), the
+            content max-fidelity tracing improves.
+    Low   → the image is mostly text, hairlines and flat fills, the content
+            max-fidelity tracing degrades (sharpen halos) or merely inflates.
+
+    Transparent pixels are composited onto white first so that the alpha edge
+    of a cut-out subject reads as one silhouette edge, not as a colour cliff.
+    """
+    import numpy as np
+
+    img = image.astype(np.float32)
+    if img.ndim == 3 and img.shape[2] == 4:
+        a = img[:, :, 3:4] / 255.0
+        img = img[:, :, :3] * a + 255.0 * (1.0 - a)
+
+    luma = img.mean(axis=2)
+    gy, gx = np.gradient(luma)
+    mag = np.hypot(gx, gy)
+
+    ramp = np.count_nonzero((mag > Config.AUTO_FIDELITY_RAMP_LO) &
+                            (mag < Config.AUTO_FIDELITY_RAMP_HI))
+    hard = np.count_nonzero(mag > Config.AUTO_FIDELITY_HARD_MAG)
+    return ramp / max(hard, 1)
+
+
+def _dominant_color(image) -> str:
+    """
+    Most common colour in the image, as an SVG hex string.
+
+    Counted on a coarsely quantised copy so that a smooth ramp's thousands of
+    near-identical shades sum into one bucket instead of splitting the vote.
+    Fully transparent pixels do not count — they are not part of the artwork.
+    """
+    import numpy as np
+
+    img = image
+    if img.ndim == 3 and img.shape[2] == 4:
+        opaque = img[:, :, 3] > 0
+        if not opaque.any():
+            return "#ffffff"
+        px = img[:, :, :3][opaque]
+    else:
+        px = img[:, :, :3].reshape(-1, 3)
+
+    q = (px.astype(np.uint16) >> 4)                  # 16 levels per channel
+    keys = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
+    top = np.bincount(keys).argmax()
+    r, g, b = (int(top) >> 8) & 0xF, (int(top) >> 4) & 0xF, int(top) & 0xF
+    # Bucket centre, so the colour sits mid-bucket rather than at its floor.
+    return "#%02x%02x%02x" % ((r << 4) + 8, (g << 4) + 8, (b << 4) + 8)
+
+
+def _auto_max_fidelity(image) -> bool:
+    """Decide whether to trace at max fidelity based on image content."""
+    if not Config.AUTO_FIDELITY_ENABLED:
+        return False
+
+    h, w = image.shape[:2]
+    if h * w > Config.AUTO_FIDELITY_MAX_PIXELS:
+        logger.info("Max-fidelity auto: OFF (%d×%d exceeds pixel budget)", w, h)
+        return False
+
+    ratio = _ramp_hard_ratio(image)
+    on = ratio >= Config.AUTO_FIDELITY_MIN_RATIO
+    logger.info("Max-fidelity auto: %s (ramp/hard %.1f vs threshold %.1f)",
+                "ON" if on else "OFF", ratio, Config.AUTO_FIDELITY_MIN_RATIO)
+    return on
+
+
 def run_pipeline(
     input_path: str,
     output_path: str,
@@ -79,6 +152,16 @@ def run_pipeline(
         logger.info("Loading %s", input_path)
         ctx.original_image = _load_image(input_path)
         ctx.png_size_bytes = os.path.getsize(input_path)
+
+        # An explicit request always wins; otherwise decide from the content.
+        if not ctx.max_fidelity:
+            ctx.max_fidelity = _auto_max_fidelity(ctx.original_image)
+
+        # Whatever leaks through an anti-aliased seam between two traced tiles
+        # is this rect. Defaulting it to white means every seam in a dark image
+        # leaks a bright hairline; painting the image's own dominant colour
+        # makes that leakage self-cancelling instead of maximally visible.
+        ctx.background_color = _dominant_color(ctx.original_image)
 
         # If --test-stage, run just that stage and exit
         if test_stage:

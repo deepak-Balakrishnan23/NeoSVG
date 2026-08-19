@@ -131,6 +131,33 @@ def _smoothness_thresholds(
     return thr
 
 
+def _beats_bands(colors: np.ndarray, member_labels: np.ndarray,
+                 ss_res) -> bool:
+    """
+    True when a fitted ramp reconstructs its own pixels at least as well as the
+    per-label flat bands it would replace.
+
+    `ss_res` is the ramp's sum of squared error over `colors`; the bands' error
+    is the within-label sum of squares over the same pixels. Both are computed
+    on the identical pixel set, so the comparison is direct.
+    """
+    if ss_res is None:                 # fitter did not report one — old contract
+        return True
+
+    uniq, inv = np.unique(member_labels, return_inverse=True)
+    cnt = np.bincount(inv, minlength=len(uniq)).astype(np.float64)
+    ss_bands = 0.0
+    for c in range(colors.shape[1]):
+        s  = np.bincount(inv, weights=colors[:, c], minlength=len(uniq))
+        s2 = np.bincount(inv, weights=colors[:, c] ** 2, minlength=len(uniq))
+        ss_bands += float(np.sum(s2 - (s * s) / np.maximum(cnt, 1.0)))
+
+    # A ramp also removes the seams BETWEEN those bands, which is worth real
+    # perceptual quality that this residual cannot see, so allow a small margin
+    # rather than demanding a strict win.
+    return float(ss_res) <= Config.REGION_GRADIENT_BAND_MARGIN * ss_bands
+
+
 def _fit_region_gradients(labels: np.ndarray, rgb: np.ndarray):
     """
     Coalesce adjacent near-colour bands, then fit a linear gradient to each
@@ -216,6 +243,18 @@ def _fit_region_gradients(labels: np.ndarray, rgb: np.ndarray):
             if grad is None:
                 continue
 
+            # R² measures the ramp against a SINGLE flat fill — a baseline this
+            # pipeline never paints.  What actually gets replaced is the stack
+            # of per-label bands, which is a much better approximation, so a fit
+            # can clear R² and still render worse than what it displaces.  One
+            # oversized bad ramp can then own a large share of the canvas and
+            # produce exactly the wrong-hue blotches this is meant to remove.
+            #
+            # Compare like with like: the bands' own residual is the sum of
+            # within-label variance over the same sampled pixels.
+            if not _beats_bands(rgb_flat[sidx], flat[sidx], grad.get("ss_res")):
+                continue
+
             members = np.unique(flat[idx])
             gradients[g]    = grad
             remap[members]  = g
@@ -236,6 +275,7 @@ def _merge_small_regions(
     labels: np.ndarray,
     rgb: np.ndarray,
     min_area,
+    max_merge_delta: float = None,
 ) -> np.ndarray:
     """
     Absorb every sub-`min_area` region into its most COLOUR-SIMILAR adjacent
@@ -304,6 +344,19 @@ def _merge_small_regions(
     # A region uses its OWN smoothness threshold (thr[i]); the grown root uses
     # the root's threshold so a band growing inside a smooth zone stops at the
     # smooth (small) target instead of bloating to the subject threshold.
+    # The colour a region's pixels will actually be painted with is the root's
+    # mean, so the ceiling below is tested against each region's OWN original
+    # mean (means0), not against the running root mean.  means[] drifts as a
+    # root accretes: once a band is large its mean describes the whole band
+    # rather than the colour at the frontier, and a cell touching the far end
+    # gets compared against a colour that may be nowhere near it.  That is how
+    # a cyan cell ends up welded into a magenta band and painted magenta —
+    # the isolated wrong-hue islands in smooth ramps.
+    means0 = means.copy()
+    cap = (Config.MERGE_MAX_COLOR_DELTA if max_merge_delta is None
+           else max_merge_delta)
+    cap_sq = float(cap) ** 2
+
     order = [i for i in range(1, n) if counts[i] < thr[i]]
     order.sort(key=lambda i: counts[i])
     for i in order:
@@ -319,6 +372,11 @@ def _merge_small_regions(
             if d < best_d:
                 best_d, best = d, rj
         if best is not None:
+            # Refuse a merge that would mis-colour this region's pixels beyond
+            # the cap.  Staying unmerged costs one extra small path; merging
+            # across a real colour step costs a visible blotch.
+            if float(np.sum((means0[i] - means[best]) ** 2)) > cap_sq:
+                continue
             parent[ri] = best
             tot = counts[best] + counts[ri]
             means[best] = (means[best] * counts[best] + means[ri] * counts[ri]) / max(tot, 1.0)
@@ -393,6 +451,14 @@ def vectorize(
 
     color_precision = int(overrides.get(
         "color_precision", preset.get("color_precision", 6)))
+    # Pixel art has no curves to fit: its boundaries are axis-aligned block
+    # edges, so a spline fit spends control points rounding corners that are
+    # genuinely square. Measured on 32x32 art upscaled 16x (1642 paths):
+    #   spline  877 KB / SSIM 0.916    <- fits curves to square corners
+    #   pixel  1430 KB / SSIM 0.918    <- keeps every staircase vertex
+    #   polygon 446 KB / SSIM 0.917    <- collapses collinear runs, corners exact
+    # Polygon wins outright: half the bytes of spline at equal fidelity.
+    curve_mode = str(overrides.get("curve_mode", preset.get("curve_mode", "spline")))
     color_precision = max(1, min(8, color_precision))
     meanshift_sp     = int(preset.get("meanshift_sp", 0))
     meanshift_sr     = int(preset.get("meanshift_sr", 0))
@@ -562,12 +628,29 @@ def vectorize(
         #     file size) and removes the faint wiggle/streak look on smooth
         #     zones.  A smooth band genuinely needs few control points.
         big = rp.area / 25000.0
-        error_thr_adapt  = max(0.3, error_thr * (0.6 + big))
+        # `big` is unbounded, so on a large region this licence grows without
+        # limit — precisely on the big silhouette paths whose outline the eye
+        # actually judges, while the tight `bezier_error` of a detail level like
+        # ultra ends up applying to nothing. Cap how far any curve may wander.
+        error_thr_adapt  = min(Config.BEZIER_ERROR_MAX,
+                               max(0.3, error_thr * (0.6 + big)))
         epsilon_override = min(3.0, max(0.2, seg_len * (0.3 + big)))
         max_depth_adapt  = 12
 
         # Offset from cropped sub-array space back to full-image (x, y).
-        off = np.array([[minc - 1, minr - 1]], dtype=np.float32)
+        #
+        # Two corrections are folded into one constant:
+        #   −1        undo the 1-px border added to `sub` above.
+        #   +0.5      array space → SVG user space.  find_contours walks the
+        #             0.5 iso-level, so its coordinates are already on the
+        #             boundary between pixel CENTRES: the left edge of pixel 5
+        #             comes back as 4.5.  In SVG, pixel 5 spans user-space
+        #             [5, 6] and its centre is 5.5, so every coordinate needs
+        #             half a pixel added.  Without it the entire drawing sits
+        #             half a pixel up and to the left of where it belongs,
+        #             which both blurs every edge against the pixel grid and
+        #             leaves the right and bottom rows of the canvas uncovered.
+        off = np.array([[minc - 0.5, minr - 0.5]], dtype=np.float32)
 
         # Sort a region's contours largest-first; with holes filled there is
         # normally just one outer contour per region.  We do NOT apply a
@@ -581,7 +664,7 @@ def vectorize(
             ci  = pts.round().astype(np.int32).reshape(-1, 1, 2)
             d = _contour_to_path(
                 pts.reshape(-1, 1, 2).astype(np.float32),
-                "spline", corner_deg, seg_len,
+                curve_mode, corner_deg, seg_len,
                 error_thr_adapt, prec_path,
                 epsilon_override=epsilon_override,
                 max_depth=max_depth_adapt,
@@ -594,6 +677,13 @@ def vectorize(
                 "color":      color_hex,
                 "opacity":    1.0,
                 "area":       float(rp.area),
+                # `area` above is the PARENT region's pixel count, shared by
+                # every contour it produced. A region with satellites gives its
+                # tiny islands that same large area, so they sort as if huge and
+                # get painted early — then every genuinely larger region paints
+                # straight over them and they vanish. Keep each contour's own
+                # polygon area so the ordering can break those ties correctly.
+                "poly_area":  float(abs(cv2.contourArea(ci))),
                 "bbox":       (bx, by, bw, bh),
                 "smooth_ctx": smooth_ctx,
             }
@@ -606,7 +696,10 @@ def vectorize(
             path_records.append(rec)
 
     # Painter's order: largest first so smaller detail regions composite on top.
-    path_records.sort(key=lambda r: r["area"], reverse=True)
+    # Region area stays the primary key, so overall layering is unchanged; the
+    # contour's own area breaks ties within a region, which is what keeps a
+    # parent's satellites from being painted before larger regions.
+    path_records.sort(key=lambda r: (r["area"], r["poly_area"]), reverse=True)
     logger.info(
         "Trace: %d paths emitted (%d distinct colors)",
         len(path_records), len(set(r["color"] for r in path_records)),

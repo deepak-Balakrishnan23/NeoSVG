@@ -1,6 +1,19 @@
 # NeoSVG — PathSimplifier stage
 # Runs the Visvalingam-Whyatt simplifier on every freeform path.
 # Paths that already have a primitive_svg replacement are skipped.
+#
+# NOTE: this stage is INERT on the NeoSVG Engine path, which is the only engine
+# currently shipped. Verified by instrumenting a full ultra run on a 678x784
+# gradient logo: the stage is invoked once, it modifies 0 of 978 paths, and
+# simplify_svg_path is never called. The engine emits cubic Beziers whose node
+# count is already governed by its own error tolerance, and this simplifier only
+# has something to remove on straight-line polylines.
+#
+# Consequence: Config.DEFAULT_SIMPLIFY_TOLERANCE, TEXT_ADJACENT_TOLERANCE and
+# BACKGROUND_SIMPLIFY_TOLERANCE currently affect nothing. Left in place rather
+# than deleted because the stage is engine-agnostic and would do real work for a
+# polyline-emitting engine, but do not tune those values expecting an effect —
+# measure first.
 
 import logging
 from typing import List, Tuple

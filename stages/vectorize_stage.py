@@ -45,7 +45,18 @@ _NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
 # interpolated by each tile's `smooth_ctx` (0 = busy subject, 1 = flat
 # gradient), which the engine tags onto every record.
 _SEAM_STROKE_MIN = 0.6   # busy/detail tiles — keep edges crisp
-_SEAM_STROKE_MAX = 4.0   # flat gradient bands — fully seal seams + pin-holes
+# A seam is an anti-aliased crack roughly one pixel wide, so sealing it needs a
+# stroke of about that order. 4.0 was set when two other defects were widening
+# the cracks it had to cover: every path was offset half a pixel from where it
+# belonged, and the rect showing through was hardcoded white regardless of the
+# artwork. With both fixed, a 4px stroke is no longer sealing anything — it is
+# only dilating every band by 2px on each side, which is pure edge damage on
+# exactly the smooth regions that dominate a gradient image.
+# Measured (gradient logo, detail=ultra, edge-band MAE against the source):
+#   4.0 → 8.72   2.0 → 7.13   1.5 → 7.03   1.0 → 7.07   0.6 → 7.32   off → 10.23
+# Still clearly needed — turning it off is far worse than any width — but the
+# optimum is near 1.5, not 4.0.
+_SEAM_STROKE_MAX = 1.5   # flat gradient bands — seal seams without dilating
 
 # A stroke this wide is only ever worth its cost when there is an OPAQUE
 # BACKGROUND RECT behind the tiles to bleed through.  The assembler paints that
@@ -59,6 +70,14 @@ _SEAM_STROKE_MAX_TRANSPARENT = 0.8
 
 # A seam stroke may never exceed this fraction of a shape's thinnest dimension.
 _SEAM_STROKE_MAX_FRAC = 0.18
+
+
+def _engine_overrides(ctx) -> dict:
+    """Per-image engine overrides derived from the classifier's verdict."""
+    if getattr(ctx, "image_type", "") == "PIXELART":
+        # Square boundaries: keep them square, and collapse collinear runs.
+        return {"curve_mode": "polygon"}
+    return {}
 
 
 def _seal_seams(rec: dict, has_transparency: bool = False) -> None:
@@ -190,7 +209,8 @@ def run_vectorize(ctx: Context) -> Context:
             prepped, scale = prepare_for_engine(
                 layer.image, max_fidelity=max_fidelity, use_key_color=use_key,
             )
-            paths = vec(image=prepped, detail=detail)
+            paths = vec(image=prepped, detail=detail,
+                        overrides=_engine_overrides(ctx))
 
             inv = 1.0 / scale if scale != 1.0 else 1.0
             for p in paths:
@@ -226,9 +246,11 @@ def run_vectorize(ctx: Context) -> Context:
     # applied boost_edges via preprocessing — pass max_fidelity=False to the
     # engine to avoid double-applying.
     try:
-        paths = vec(image=prepped, detail=detail, max_fidelity=False)
+        paths = vec(image=prepped, detail=detail, max_fidelity=False,
+                    overrides=_engine_overrides(ctx))
     except TypeError:
-        paths = vec(image=prepped, detail=detail)
+        paths = vec(image=prepped, detail=detail,
+                    overrides=_engine_overrides(ctx))
 
     inv = 1.0 / scale if scale != 1.0 else 1.0
 

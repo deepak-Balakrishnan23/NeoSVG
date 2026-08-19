@@ -133,7 +133,36 @@ engines/
   visvalingam.py                    Visvalingam-Whyatt path simplifier
 stages/          Pipeline stages (classify, preprocess, segment, …)
 static/          Web UI
+tests/           Regression suite (fixtures, metrics, quality budgets)
 ```
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Standard library only — no pytest required, though `pytest tests` works too.
+Test images are generated in code from a seeded RNG (`tests/fixtures.py`), so
+the repo carries no binary fixtures and every run is identical.
+
+The suite asserts more than SSIM. SSIM is a poor sole judge of this pipeline: it
+under-weights wrong-hue patches inside a smooth ramp — the defect people notice
+first — and it moves whenever band *count* changes even when nothing looks
+different. On a smooth gradient it will even rank a coarse output above a more
+accurate one. So each fixture also carries budgets for perceptual colour error
+(CIE Lab dE), the area of contiguous visibly-wrong blotches, and error split
+between the edge band and the interior — the split is what localises a failure
+to the tracer rather than the segmenter.
+
+Quality budgets live in `BUDGETS` in `tests/test_regression.py`. They are
+ceilings taken from a known-good run with headroom, so refactors pass and real
+quality losses fail. Alongside them are unit tests pinning specific defects
+(gradient stop offsets, the pixel-art detector, the fidelity gate, preset
+ordering) so a fix cannot be silently undone.
+
+The quality tests skip themselves if Cairo is unavailable, since they need to
+rasterise the SVG back; the unit tests always run.
 
 ## License
 

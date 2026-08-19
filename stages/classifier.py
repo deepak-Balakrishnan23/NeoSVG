@@ -63,8 +63,26 @@ def _avg_saturation(thumb: np.ndarray) -> float:
 
 def _pixelart_score(img: np.ndarray) -> float:
     """
-    Fraction of gradient-edge pixels that align to a small integer grid.
-    High score → pixel art.
+    How strongly the image's edges lie on a regular pixel grid. 1 = perfect
+    pixel art, 0 = no more grid alignment than chance.
+
+    Two things this has to get right, both of which the previous version got
+    wrong and which together made the score unreachable:
+
+    * An edge pixel belongs to the grid when it lies on a grid LINE, not on a
+      grid intersection. Requiring `x % g == 0 AND y % g == 0` only counts
+      corners: a vertical block edge runs down every row, so just 1/g of its
+      pixels have y on-grid, capping the achievable score near 1/g. Ideal
+      pixel art scored 0.11-0.25 against a 0.65 threshold, so the PIXELART
+      branch could never be taken by any input.
+
+    * Alignment has to be measured against CHANCE. Plain OR is why the AND was
+      introduced: at g=2 roughly 3/4 of all pixels sit on a grid line whatever
+      the image. Subtracting the expected rate fixes that properly, and lets
+      small grids be tested without inflating their score.
+
+    Upscaled pixel art also uses larger factors than the 2/3/4/8 previously
+    tried; a 16x or 32x nearest-neighbour upscale is ordinary.
     """
     gray  = cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 50, 150)
@@ -72,15 +90,24 @@ def _pixelart_score(img: np.ndarray) -> float:
     if len(xs) < 20:
         return 0.0
 
-    # Check alignment to grids of size 2, 3, 4, 8.
-    # Use AND so both x and y must be on-grid — OR gives ~75% for any image
-    # with g=2 just by chance and causes systematic misclassification.
+    n = len(xs)
     best = 0.0
-    for g in (2, 3, 4, 8):
-        aligned = np.sum((xs % g == 0) & (ys % g == 0))
-        ratio   = aligned / len(xs)
-        best    = max(best, ratio)
-    return best
+    for g in (2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32):
+        # Canny puts the response on either side of the true boundary, so a
+        # block edge lands on g-1 as readily as on 0.
+        gx = (xs % g); gy = (ys % g)
+        on_x = (gx == 0) | (gx == g - 1)
+        on_y = (gy == 0) | (gy == g - 1)
+        observed = float(np.count_nonzero(on_x | on_y)) / n
+
+        # Expected fraction if edges were placed uniformly at random.
+        px = min(1.0, 2.0 / g)
+        chance = px + px - px * px
+        if chance >= 1.0:
+            continue
+        best = max(best, (observed - chance) / (1.0 - chance))
+
+    return max(0.0, best)
 
 
 def _color_variance(img: np.ndarray) -> float:
@@ -115,7 +142,12 @@ def classify(ctx: Context) -> Context:
     # --- features -----------------------------------------------------------
     n_colors  = _count_quantized_colors(thumb, n=32)
     avg_sat   = _avg_saturation(thumb)
-    px_score  = _pixelart_score(thumb)
+    # Grid alignment only exists at full resolution. The 64px thumbnail is
+    # produced with INTER_AREA at a non-integer scale, which both blurs the
+    # block edges and moves them off any grid — so measuring this on the
+    # thumbnail destroyed the one property it was trying to detect. Colour
+    # count and saturation are averages and survive downscaling; this does not.
+    px_score  = _pixelart_score(img)
     variance  = _color_variance(img)
     short_dim = min(h, w)
 
